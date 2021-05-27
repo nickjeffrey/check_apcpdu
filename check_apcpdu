@@ -1,0 +1,304 @@
+#!/usr/bin/perl
+
+
+# CHANGE LOG
+# ----------
+# 2012/11/13	njeffrey	Script created to monitor ambient temperature on APC UPS with environmental monitoring card
+# 2013/08/14	njeffrey	Add capability to monitor UPS runtime, battery status
+# 2016/02/16	njeffrey	Add capability to monitor dry contacts (for water sensor)
+# 2016/02/16	njeffrey	Confirm $snmpwalk exists
+# 2018/04/08	njeffrey	Bug fixes in print_output subroutine, add --verbose parameter
+# 2018/07/07	njeffrey	Add nagios performance data to output
+# 2019/04/09	njeffrey	Rework script to monitor APC PDU instead of UPS
+
+
+# nagios shell script to query APC AP7900 PDU for health status and power consumptipon
+
+
+# NOTES
+# -----
+#  WARNING: This script has only been tested on single-phase PDUs.  Three-phase PDUs will probably need to have each phase checked seperately!
+#
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script queries a remote host via SNMP
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#      # Define a service to check the APC PDU
+#      # Parameters are SNMP community name
+#      define service {
+#              use                             generic-service
+#              hostgroup_name                  all_apcpdu
+#              service_description             APC PDU
+#              check_command                   check_apcpdu!public
+#              }
+#
+#
+#  You will also need a command definition similar to the following in commands.cfg on the nagios server
+#      # 'check_apcpdu' command definition
+#      # parameters are -H hostname -C snmp_community
+#      define command{
+#              command_name    check_apcpdu
+#              command_line    $USER1$/check_apcpdu -H $HOSTADDRESS$ -C $ARG1$
+#              }
+#
+#
+
+# Different APC PDU may use slightly different OID values.  Here are a few:
+#  AP7900 
+#     .iso.org.dod.internet.private.enterprises.apc.products.hardware.rPDU.rPDUIdent.rPDULoad.rPDULoadDevice.rPDULoadDevMaxPhaseLoad 
+#     .1.3.6.1.4.1.318.1.1.12.2.1.1    
+#     Getting this OID will return the maximum rated power that each phase of the Rack PDU can provide. It is represented in Amps.
+# 
+#     .iso.org.dod.internet.private.enterprises.apc.products.hardware.rPDU.rPDUIdent.rPDULoad.rPDULoadStatus.rPDULoadStatusLoad 
+#     .1.3.6.1.4.1.318.1.1.12.2.3.1.1.2.1
+#     Getting this OID will return the phase/bank load measured in tenths of Amps
+# 
+
+
+
+
+
+
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;                       #allow --long-switches to be used as parameters.  Install with: perl -MCPAN -e 'install Getopt::Long'
+
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$cmd,$snmpwalk,$snmpget);
+my ($host,$oid,$key,%apcpdu,$community);
+my ($opt_h,$opt_v,$opt_C,$opt_H);
+my ($verbose,$output_details,$perf_data);
+$cmd = "";                                              #initialize variable
+$CHECK_NAME                 = "APC PDU";		#name of nagios check
+$verbose                    = "no";                    	#yes/no variable to increase output for debugging
+$community                  = "public";  		#default SNMP community name
+$output_details             = "";			#initialize variable to hold details of script output
+$snmpwalk                   = "/usr/bin/snmpwalk";	#location of binary
+$snmpget                    = "/usr/bin/snmpget";	#location of binary
+#
+# Nagios return codes
+#
+$OK=            0;
+$WARN=          1;
+$CRITICAL=      2;
+$UNKNOWN=       3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "C=s" => \$opt_C, "community=s" => \$opt_C, "comm=s" => \$opt_C,
+      "H=s" => \$opt_H, "hostname=s"  => \$opt_H, "host=s" => \$opt_H,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   #
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for determining APC PDU power consumption. \n";
+      print "Examples: \n";
+      print "   $0 --host=myhost --community=public \n";
+      print "   $0     -H myhost          -C public \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   # If the user supplied -v or --verbose, increase verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } 
+   #
+   #
+   # If the user did not supply a --community SNMP community string, use "public"
+   #
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
+   } else {
+      $community = "public";
+   }
+   #
+   # If the user did not supply a --host=??? , generate a warning
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME UNKNOWN - a remote host to check was not provided. Use this syntax: $0 -H hostname -C snmp_community\n";
+      exit $CRITICAL;                                           #exit script
+   }
+   #
+   print "host=$host community=$community \n" if ($verbose eq "yes");
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   if ( ! -f "$snmpwalk" ) {
+      print "ERROR: Cannot find $snmpwalk \n";
+      exit;
+   }
+   if ( ! -x "$snmpwalk" ) {
+      print "ERROR: $snmpwalk is not executable by the current user\n";
+      exit;
+   }
+   if ( ! -f "$snmpget" ) {
+      print "ERROR: Cannot find $snmpget \n";
+      exit;
+   }
+   if ( ! -x "$snmpget" ) {
+      print "ERROR: $snmpget is not executable by the current user\n";
+      exit;
+   }
+}                                                       #end of subroutine
+
+
+
+
+sub check_pdu {
+   #
+   # query the SNMP counters to see the current power consumption on the PDU
+   # This uses the APC PowerNet MIB
+   #
+   print "running check_pdu subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.318.1.1.12.2.3.1.1.2.1";                             
+   $cmd = "$snmpwalk -Onq -v 1 -c $community $host $oid";
+   print "   Checking current  power consumption with: $cmd \n" if ($verbose eq "yes");
+   $apcpdu{rPDULoadStatusLoad} = "unknown";				#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid ([0-9]+)/ ) {         					#value returned will be in tenths of amps
+         $apcpdu{rPDULoadStatusLoad} = $1;   	         		#assign value to hash
+         if ( $apcpdu{rPDULoadStatusLoad} > 0 ) {			#avoid divide by zero error if there is zero workload on PDU
+            $apcpdu{rPDULoadStatusLoad} = $apcpdu{rPDULoadStatusLoad} / 10;#convert tenths of amps to amps
+            $apcpdu{rPDULoadStatusLoad} = sprintf("%.1f",$apcpdu{rPDULoadStatusLoad}); #truncate to 1 decimal place
+         }
+         print "   PDU power consumption: $apcpdu{rPDULoadStatusLoad} amps \n" if ($verbose eq "yes");
+      }
+   }                                                                    #end of while loop
+   #
+   # Figure out the maximum # of amps the PDU can draw
+   $oid = ".1.3.6.1.4.1.318.1.1.12.2.1.1.0";
+   $cmd = "$snmpwalk -Onq -v 1 -c $community $host $oid";
+   print "   Checking maximum power draw supported by PDU with: $cmd \n" if ($verbose eq "yes");
+   $apcpdu{rPDULoadDevMaxPhaseLoad} = "unknown";			#initialize variable
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid ([0-9]+)/ ) {         					#value returned will be in tenths of amps
+         $apcpdu{rPDULoadDevMaxPhaseLoad} = $1;   	         		#assign value to hash
+         print "   PDU max power draw: $apcpdu{rPDULoadDevMaxPhaseLoad} amps \n" if ($verbose eq "yes");
+      }
+   }                                                                    #end of while loop
+}									#end of subroutine 
+
+
+
+
+
+
+sub print_output {
+   #
+   # print output in the format expected by nagios
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   #
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   # You can use the standard nagios ranges and thresholds formats (examples below)
+   # Range definition	Generate an alert if x...
+   # ----------------   -------------------------
+   # 10	                < 0 or > 10, (outside the range of {0 .. 10})
+   # 10:	        < 10, (outside {10 .. âˆž})
+   # ~:10	        > 10, (outside the range of {-âˆž .. 10})
+   # 10:20	        < 10 or > 20, (outside the range of {10 .. 20})
+   # @10:20	        â‰¥ 10 and â‰¤ 20, (inside the range of {10 .. 20})
+   #
+   $perf_data = "amps=$apcpdu{rPDULoadStatusLoad};;;; max_amps:$apcpdu{rPDULoadDevMaxPhaseLoad};;;;";
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   #
+   $output_details = "power_consumption:$apcpdu{rPDULoadStatusLoad}amps  max_load:$apcpdu{rPDULoadDevMaxPhaseLoad}amps";
+   #
+   #
+   if (  $apcpdu{rPDULoadStatusLoad} eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Could not determine PDU power consumption.  Please investigate.  $output_details | $perf_data \n";
+      exit $UNKNOWN; 
+   }
+   #
+   if (  $apcpdu{rPDULoadDevMaxPhaseLoad} eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Could not determine PDU maximum power draw.  Please investigate.  $output_details | $perf_data \n";
+      exit $UNKNOWN; 
+   }
+   #
+   if ( $apcpdu{rPDULoadStatusLoad} > $apcpdu{rPDULoadDevMaxPhaseLoad} ) {
+      print "$CHECK_NAME WARN - current power consumption is $apcpdu{rPDULoadStatusLoad}, which is overloading the PDU.  $output_details | $perf_data \n";
+      exit $WARN; 
+   }
+   #
+   if ( $apcpdu{rPDULoadStatusLoad} == $apcpdu{rPDULoadDevMaxPhaseLoad} ) {
+      print "$CHECK_NAME WARN - current power consumption is $apcpdu{rPDULoadStatusLoad} amps, which is the maximum load supported by this PDU.  $output_details | $perf_data \n";
+      exit $WARN; 
+   }
+   #
+   if ( ($apcpdu{rPDULoadDevMaxPhaseLoad} - $apcpdu{rPDULoadStatusLoad}) <= 1 ) {
+      print "$CHECK_NAME WARN - current power consumption is $apcpdu{rPDULoadStatusLoad} amps, which is very close to the maximum load supported by this PDU.  $output_details | $perf_data \n";
+      exit $WARN; 
+   }
+   #
+   #
+   # This message gets sent if everything is ok
+   print "$CHECK_NAME OK - $output_details | $perf_data \n";
+   exit $OK;
+   #
+   # The script should never get this far
+   print "$CHECK_NAME UNKNOWN - Could not determine PDU status.  Please investigate. $output_details | $perf_data \n";
+   exit $UNKNOWN;
+}                                                                       #end of subroutine
+
+
+
+
+
+# --------------------------- main body of program ----------------------
+get_options;
+sanity_checks;
+check_pdu;
+print_output;
+
